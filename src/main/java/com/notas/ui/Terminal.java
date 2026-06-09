@@ -7,7 +7,8 @@ import com.googlecode.lanterna.input.KeyStroke;
 import com.googlecode.lanterna.input.KeyType;
 import com.googlecode.lanterna.screen.Screen;
 import com.googlecode.lanterna.screen.TerminalScreen;
-import com.googlecode.lanterna.terminal.DefaultTerminalFactory;
+import com.googlecode.lanterna.terminal.swing.SwingTerminalFrame;
+import com.googlecode.lanterna.terminal.swing.TerminalEmulatorAutoCloseTrigger;
 import com.notas.datos.Archivos;
 import com.notas.model.Nota;
 
@@ -46,13 +47,15 @@ public class Terminal {
     private Nota editando = null;
 
     public void iniciar() throws Exception {
-        DefaultTerminalFactory factory = new DefaultTerminalFactory();
-        // Run inside the real terminal (CMD/PowerShell); fall back to Swing in IDE
-        if (System.console() != null) {
-            factory.setForceTextTerminal(true);
-        }
-        com.googlecode.lanterna.terminal.Terminal term = factory.createTerminal();
-        screen = new TerminalScreen(term);
+        SwingTerminalFrame frame = new SwingTerminalFrame(
+                "notas",
+                TerminalEmulatorAutoCloseTrigger.CloseOnExitPrivateMode
+        );
+        frame.setSize(1020, 660);
+        frame.setVisible(true);
+        Thread.sleep(100);
+
+        screen = new TerminalScreen(frame);
         screen.startScreen();
         screen.setCursorPosition(null);
 
@@ -65,6 +68,7 @@ public class Terminal {
         }
 
         screen.stopScreen();
+        frame.dispose();
     }
 
     // ── Data ──────────────────────────────────────────────────────────────────
