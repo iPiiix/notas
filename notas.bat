@@ -1,3 +1,3 @@
 @echo off
 chcp 65001 > nul
-java -jar target\notas-1.0-SNAPSHOT.jar
+"C:\Program Files\JetBrains\IntelliJ IDEA Community Edition 2025.1.1.1\jbr\bin\java.exe" -jar target\notas-1.0-SNAPSHOT.jar
