@@ -12,11 +12,23 @@ import com.notas.datos.Archivos;
 import com.notas.model.Nota;
 
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
 public class Terminal {
+
+    // ── Palette ───────────────────────────────────────────────────────────────
+    private static final TextColor FG     = TextColor.ANSI.GREEN;
+    private static final TextColor BG     = TextColor.ANSI.BLACK;
+    private static final TextColor FG_DIM = TextColor.ANSI.CYAN;
+    private static final TextColor FG_HI  = TextColor.ANSI.WHITE;
+    private static final TextColor FG_FAV = TextColor.ANSI.YELLOW;
+    private static final TextColor SEL_FG = TextColor.ANSI.BLACK;
+    private static final TextColor SEL_BG = TextColor.ANSI.GREEN;
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("MM-dd");
 
     private enum State { LIST, VIEW, NEW_TITLE, NEW_CONTENT, EDIT_CONTENT, CONFIRM_DELETE, SEARCH }
 
@@ -34,7 +46,12 @@ public class Terminal {
     private Nota editando = null;
 
     public void iniciar() throws Exception {
-        com.googlecode.lanterna.terminal.Terminal term = new DefaultTerminalFactory().createTerminal();
+        DefaultTerminalFactory factory = new DefaultTerminalFactory();
+        // Run inside the real terminal (CMD/PowerShell); fall back to Swing in IDE
+        if (System.console() != null) {
+            factory.setForceTextTerminal(true);
+        }
+        com.googlecode.lanterna.terminal.Terminal term = factory.createTerminal();
         screen = new TerminalScreen(term);
         screen.startScreen();
         screen.setCursorPosition(null);
@@ -54,7 +71,11 @@ public class Terminal {
 
     private void recargar() {
         notas = archivos.loadAll();
-        notas.sort((a, b) -> b.getFechaActualizacion().compareTo(a.getFechaActualizacion()));
+        notas.sort((a, b) -> {
+            // Favorites first, then by update date
+            if (a.isFavorito() != b.isFavorito()) return a.isFavorito() ? -1 : 1;
+            return b.getFechaActualizacion().compareTo(a.getFechaActualizacion());
+        });
         aplicarFiltro();
     }
 
@@ -91,7 +112,7 @@ public class Terminal {
             char c = key.getCharacter();
             switch (c) {
                 case 'q': return false;
-                case 'j': navAbajo(); break;
+                case 'j': navAbajo();  break;
                 case 'k': navArriba(); break;
                 case 'n': inputTitulo = ""; inputContenido = ""; editando = null; estado = State.NEW_TITLE; break;
                 case 'd': if (!filtradas.isEmpty()) estado = State.CONFIRM_DELETE; break;
@@ -125,7 +146,7 @@ public class Terminal {
 
     private boolean handleNewTitle(KeyStroke key) {
         if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
-        if (key.getKeyType() == KeyType.Enter) { estado = State.NEW_CONTENT; return true; }
+        if (key.getKeyType() == KeyType.Enter)  { estado = State.NEW_CONTENT; return true; }
         inputTitulo = applyEdit(inputTitulo, key);
         return true;
     }
@@ -232,20 +253,20 @@ public class Terminal {
 
     // ── Rendering ─────────────────────────────────────────────────────────────
     //
-    // Layout (rows = terminal height):
-    //   row 0          top border  ┌─ notas ──────┬──────────────────┐
-    //   rows 1..rows-4 content     │ list         │ note             │
-    //   row rows-3     separator   ├──────────────┴──────────────────┤
-    //   row rows-2     status      │ keybindings                     │
-    //   row rows-1     bottom      └─────────────────────────────────┘
+    // Layout:
+    //   row 0          ┌─ notas ──────┬──────────────────────────────┐
+    //   rows 1..rows-4 │ list         │ note content                 │
+    //   row rows-3     ├──────────────┴──────────────────────────────┤
+    //   row rows-2     │ keybindings                                 │
+    //   row rows-1     └─────────────────────────────────────────────┘
 
     private void render() throws Exception {
         screen.clear();
         int cols = screen.getTerminalSize().getColumns();
         int rows = screen.getTerminalSize().getRows();
         TextGraphics g = screen.newTextGraphics();
-        g.setForegroundColor(TextColor.ANSI.WHITE);
-        g.setBackgroundColor(TextColor.ANSI.BLACK);
+        g.setForegroundColor(FG);
+        g.setBackgroundColor(BG);
 
         boolean inEditor = estado == State.NEW_TITLE
                 || estado == State.NEW_CONTENT
@@ -265,6 +286,8 @@ public class Terminal {
     }
 
     private void renderFrame(TextGraphics g, int cols, int rows, int listW) {
+        g.setForegroundColor(FG);
+
         // Top border
         g.setCharacter(0, 0, Symbols.SINGLE_LINE_TOP_LEFT_CORNER);
         g.setCharacter(cols - 1, 0, Symbols.SINGLE_LINE_TOP_RIGHT_CORNER);
@@ -276,7 +299,7 @@ public class Terminal {
         vline(g, 0, 1, rows - 2);
         vline(g, cols - 1, 1, rows - 2);
 
-        // Vertical divider (content rows only)
+        // Vertical divider
         vline(g, listW + 1, 1, rows - 4);
 
         // Separator
@@ -295,11 +318,11 @@ public class Terminal {
         int height = contentRows();
 
         if (estado == State.SEARCH) {
-            g.setForegroundColor(TextColor.ANSI.YELLOW);
+            g.setForegroundColor(FG_FAV);
             String bar = "/ " + inputBusqueda + "█";
             if (bar.length() > listW - 1) bar = bar.substring(0, listW - 1);
             g.putString(1, 1, bar);
-            g.setForegroundColor(TextColor.ANSI.WHITE);
+            g.setForegroundColor(FG);
         }
 
         int startRow = (estado == State.SEARCH) ? 2 : 1;
@@ -312,63 +335,63 @@ public class Terminal {
             Nota n = filtradas.get(idx);
             boolean sel = (idx == selIdx);
 
-            String fav   = n.isFavorito() ? "★" : " ";
+            String fav  = n.isFavorito() ? "★" : " ";
+            String date = n.getFechaActualizacion().format(DATE_FMT);
+            int titleMax = listW - 9; // 3 prefix + 1 space + 5 date
             String title = n.getTitulo();
-            int maxLen   = listW - 4;
-            if (title.length() > maxLen) title = title.substring(0, maxLen - 1) + "…";
-
-            StringBuilder line = new StringBuilder(" ").append(fav).append(" ").append(title);
-            while (line.length() < listW) line.append(' ');
-            String row_str = line.substring(0, listW);
+            if (title.length() > titleMax) title = title.substring(0, titleMax - 1) + "…";
+            String line = String.format(" %s %-" + titleMax + "s %s", fav, title, date);
+            if (line.length() > listW) line = line.substring(0, listW);
 
             if (sel) {
-                g.setForegroundColor(TextColor.ANSI.BLACK);
-                g.setBackgroundColor(TextColor.ANSI.WHITE);
+                g.setForegroundColor(SEL_FG);
+                g.setBackgroundColor(SEL_BG);
+            } else if (n.isFavorito()) {
+                g.setForegroundColor(FG_FAV);
             }
-            g.putString(1, row, row_str);
-            if (sel) {
-                g.setForegroundColor(TextColor.ANSI.WHITE);
-                g.setBackgroundColor(TextColor.ANSI.BLACK);
-            }
+            g.putString(1, row, line);
+            g.setForegroundColor(FG);
+            g.setBackgroundColor(BG);
         }
 
         if (!filtradas.isEmpty()) {
-            g.setForegroundColor(TextColor.ANSI.CYAN);
+            g.setForegroundColor(FG_DIM);
             g.putString(1, rows - 4, " " + (selIdx + 1) + "/" + filtradas.size());
-            g.setForegroundColor(TextColor.ANSI.WHITE);
+            g.setForegroundColor(FG);
         }
     }
 
     private void renderNote(TextGraphics g, int cols, int rows, int listW) {
-        int startCol  = listW + 2;
-        int contentW  = cols - startCol - 1;
-        int maxLines  = contentRows() - 3;
+        int startCol = listW + 2;
+        int contentW = cols - startCol - 1;
+        int maxLines = contentRows() - 3;
 
         if (filtradas.isEmpty()) {
-            g.setForegroundColor(TextColor.ANSI.CYAN);
+            g.setForegroundColor(FG_DIM);
             String msg = "sin notas  —  n para crear";
             int mx = startCol + (contentW - msg.length()) / 2;
             g.putString(Math.max(startCol, mx), rows / 2, msg);
-            g.setForegroundColor(TextColor.ANSI.WHITE);
+            g.setForegroundColor(FG);
             return;
         }
 
         Nota n = filtradas.get(selIdx);
 
         // Title
+        g.setForegroundColor(FG_HI);
         String title = n.getTitulo();
         if (title.length() > contentW) title = title.substring(0, contentW - 1) + "…";
         g.putString(startCol, 1, title);
 
         // Underline
-        g.setForegroundColor(TextColor.ANSI.CYAN);
+        g.setForegroundColor(FG);
         int sepLen = Math.min(title.length() + 2, contentW);
         StringBuilder sep = new StringBuilder();
         for (int i = 0; i < sepLen; i++) sep.append(Symbols.SINGLE_LINE_HORIZONTAL);
         g.putString(startCol, 2, sep.toString());
-        g.setForegroundColor(TextColor.ANSI.WHITE);
 
         // Content
+        g.setForegroundColor(FG);
         String[] lines = n.getContenido().split("\n", -1);
         for (int i = 0; i < Math.min(lines.length, maxLines); i++) {
             String line = lines[i];
@@ -377,16 +400,16 @@ public class Terminal {
         }
 
         // Meta
-        g.setForegroundColor(TextColor.ANSI.CYAN);
+        g.setForegroundColor(FG_DIM);
         String meta = n.getFechaCreacion().toString();
         if (!n.getTags().isEmpty()) meta += "  " + String.join(" #", n.getTags());
         if (meta.length() > contentW) meta = meta.substring(0, contentW - 1);
         g.putString(startCol, rows - 4, meta);
-        g.setForegroundColor(TextColor.ANSI.WHITE);
+        g.setForegroundColor(FG);
     }
 
     private void renderStatus(TextGraphics g, int cols, int rows) {
-        g.setForegroundColor(TextColor.ANSI.CYAN);
+        g.setForegroundColor(FG_DIM);
         String s;
         switch (estado) {
             case VIEW:           s = "  esc/q volver  e editar"; break;
@@ -396,11 +419,12 @@ public class Terminal {
         }
         if (s.length() > cols - 2) s = s.substring(0, cols - 2);
         g.putString(1, rows - 2, s);
-        g.setForegroundColor(TextColor.ANSI.WHITE);
+        g.setForegroundColor(FG);
     }
 
     private void renderEditor(TextGraphics g, int cols, int rows) {
         boolean isEdit = (estado == State.EDIT_CONTENT);
+        g.setForegroundColor(FG);
 
         // Frame
         g.setCharacter(0, 0, Symbols.SINGLE_LINE_TOP_LEFT_CORNER);
@@ -416,22 +440,18 @@ public class Terminal {
         g.setCharacter(cols - 1, rows - 1, Symbols.SINGLE_LINE_BOTTOM_RIGHT_CORNER);
         hline(g, 1, cols - 2, rows - 1);
 
-        // Title row
-        g.setForegroundColor(TextColor.ANSI.CYAN);
+        // Title field
+        g.setForegroundColor(FG_DIM);
         g.putString(2, 1, "titulo:");
-        g.setForegroundColor(TextColor.ANSI.WHITE);
-
         boolean editingTitle = (estado == State.NEW_TITLE);
+        g.setForegroundColor(editingTitle ? FG_HI : FG);
         String tDisp = inputTitulo + (editingTitle ? "█" : "");
-        if (editingTitle) g.setForegroundColor(TextColor.ANSI.YELLOW);
         if (tDisp.length() > cols - 12) tDisp = tDisp.substring(0, cols - 12);
         g.putString(10, 1, tDisp);
-        g.setForegroundColor(TextColor.ANSI.WHITE);
 
-        // Divider
-        g.setForegroundColor(TextColor.ANSI.CYAN);
+        // Divider below title
+        g.setForegroundColor(FG);
         hline(g, 2, cols - 3, 2);
-        g.setForegroundColor(TextColor.ANSI.WHITE);
 
         // Content
         boolean editingContent = (estado == State.NEW_CONTENT || estado == State.EDIT_CONTENT);
@@ -439,28 +459,30 @@ public class Terminal {
         int maxLines = rows - 7;
 
         if (editingContent && inputContenido.isEmpty()) {
-            g.setForegroundColor(TextColor.ANSI.YELLOW);
+            g.setForegroundColor(FG_HI);
             g.putString(2, 3, "█");
-            g.setForegroundColor(TextColor.ANSI.WHITE);
+            g.setForegroundColor(FG);
         }
 
         for (int i = 0; i < Math.min(lines.length, maxLines); i++) {
             String line = lines[i];
             boolean isLast = (i == lines.length - 1);
             if (isLast && editingContent) {
-                g.setForegroundColor(TextColor.ANSI.YELLOW);
+                g.setForegroundColor(FG_HI);
                 line = line + "█";
             }
             if (line.length() > cols - 4) line = line.substring(0, cols - 5) + "…";
             g.putString(2, 3 + i, line);
-            g.setForegroundColor(TextColor.ANSI.WHITE);
+            g.setForegroundColor(FG);
         }
 
         // Status
-        g.setForegroundColor(TextColor.ANSI.CYAN);
-        String hint = editingTitle ? "  enter continuar  esc cancelar" : "  ctrl+s guardar  esc cancelar";
+        g.setForegroundColor(FG_DIM);
+        String hint = editingTitle
+                ? "  enter continuar  esc cancelar"
+                : "  ctrl+s guardar  esc cancelar";
         g.putString(1, rows - 2, hint);
-        g.setForegroundColor(TextColor.ANSI.WHITE);
+        g.setForegroundColor(FG);
     }
 
     // ── Primitives ────────────────────────────────────────────────────────────
