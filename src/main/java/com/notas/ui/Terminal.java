@@ -31,20 +31,34 @@ public class Terminal {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("MM-dd");
 
-    private enum State { LIST, VIEW, NEW_TITLE, NEW_CONTENT, EDIT_CONTENT, CONFIRM_DELETE, SEARCH }
+    private enum State { LIST, VIEW, EDITOR, CONFIRM_PURGE, SEARCH, TRASH, MOVE, RENAME, HELP }
+    private enum Foco { TITULO, TAGS, CUERPO }
 
     private Screen screen;
     private final Archivos archivos = new Archivos();
     private List<Nota> notas = new ArrayList<>();
     private List<Nota> filtradas = new ArrayList<>();
+    private List<String> carpetas = new ArrayList<>();
+    private String carpetaActual = "";
     private int selIdx = 0;
     private int scroll = 0;
     private State estado = State.LIST;
 
-    private String inputTitulo = "";
-    private String inputContenido = "";
+    private final Editor tituloEd = new Editor(false);
+    private final Editor tagsEd = new Editor(false);
+    private final Editor promptEd = new Editor(false); // mover / renombrar
+    private final Editor contenidoEd = new Editor(true);
+    private Foco foco = Foco.TITULO;
     private String inputBusqueda = "";
-    private Nota editando = null;
+    private Nota editando = null;        // null = nota nueva
+    private String renombrarCarpeta = null; // carpeta que se renombra, null = se renombra una nota
+    private State helpVolver = State.LIST;
+    private int viewScroll = 0;
+    private String aviso = null;         // mensaje breve en la barra de estado
+
+    private List<Nota> papelera = new ArrayList<>();
+    private int papelIdx = 0;
+    private int papelScroll = 0;
 
     public void iniciar() throws Exception {
         SwingTerminalFrame frame = new SwingTerminalFrame(
@@ -64,6 +78,7 @@ public class Terminal {
         while (true) {
             render();
             KeyStroke key = screen.readInput();
+            aviso = null;
             if (!handle(key)) break;
         }
 
@@ -84,47 +99,116 @@ public class Terminal {
     }
 
     private void aplicarFiltro() {
+        carpetas = new ArrayList<>();
         if (inputBusqueda.isEmpty()) {
-            filtradas = new ArrayList<>(notas);
-        } else {
-            String q = inputBusqueda.toLowerCase();
+            if (carpetaActual.isEmpty()) {
+                carpetas = notas.stream()
+                        .map(Nota::getCarpeta)
+                        .filter(c -> !c.isEmpty())
+                        .distinct().sorted()
+                        .collect(Collectors.toList());
+            }
             filtradas = notas.stream()
-                    .filter(n -> n.getTitulo().toLowerCase().contains(q)
-                            || n.getContenido().toLowerCase().contains(q))
+                    .filter(n -> n.getCarpeta().equals(carpetaActual))
                     .collect(Collectors.toList());
+        } else {
+            // la búsqueda es global: ignora carpetas
+            String q = inputBusqueda.toLowerCase();
+            filtradas = notas.stream().filter(n -> coincide(n, q)).collect(Collectors.toList());
         }
-        if (selIdx >= filtradas.size()) selIdx = Math.max(0, filtradas.size() - 1);
+        int total = totalEntradas();
+        if (selIdx >= total) selIdx = Math.max(0, total - 1);
+        if (scroll > selIdx) scroll = selIdx;
+    }
+
+    private boolean coincide(Nota n, String q) {
+        if (n.getTitulo().toLowerCase().contains(q)) return true;
+        if (n.getContenido().toLowerCase().contains(q)) return true;
+        List<String> tags = n.getTags();
+        return !tags.isEmpty()
+                && ("#" + String.join(" #", tags)).toLowerCase().contains(q);
+    }
+
+    private int totalEntradas() {
+        return carpetas.size() + filtradas.size();
+    }
+
+    /** Nota bajo el cursor, o null si el cursor está sobre una carpeta o no hay nada. */
+    private Nota notaSel() {
+        int i = selIdx - carpetas.size();
+        return (i >= 0 && i < filtradas.size()) ? filtradas.get(i) : null;
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
 
     private boolean handle(KeyStroke key) {
         switch (estado) {
-            case LIST:           return handleList(key);
-            case VIEW:           return handleView(key);
-            case NEW_TITLE:      return handleNewTitle(key);
-            case NEW_CONTENT:    return handleNewContent(key);
-            case EDIT_CONTENT:   return handleEditContent(key);
-            case CONFIRM_DELETE: return handleConfirmDelete(key);
-            case SEARCH:         return handleSearch(key);
-            default:             return true;
+            case LIST:          return handleList(key);
+            case VIEW:          return handleView(key);
+            case EDITOR:        return handleEditor(key);
+            case CONFIRM_PURGE: return handleConfirmPurge(key);
+            case SEARCH:        return handleSearch(key);
+            case TRASH:         return handleTrash(key);
+            case MOVE:          return handleMove(key);
+            case RENAME:        return handleRename(key);
+            case HELP:          estado = helpVolver; return true;
+            default:            return true;
         }
     }
 
     private boolean handleList(KeyStroke key) {
+        if (key.getKeyType() == KeyType.Escape) { salirCarpeta(); return true; }
         if (key.getKeyType() == KeyType.Character) {
             char c = key.getCharacter();
             switch (c) {
                 case 'q': return false;
                 case 'j': navAbajo();  break;
                 case 'k': navArriba(); break;
-                case 'n': inputTitulo = ""; inputContenido = ""; editando = null; estado = State.NEW_TITLE; break;
-                case 'd': if (!filtradas.isEmpty()) estado = State.CONFIRM_DELETE; break;
+                case 'h': salirCarpeta(); break;
+                case 'g': selIdx = 0; scroll = 0; break;
+                case 'G': selIdx = Math.max(0, totalEntradas() - 1);
+                          scroll = Math.max(0, selIdx - contentRows() + 1); break;
+                case 'n': abrirEditor(null); break;
+                case 'd': {
+                    Nota n = notaSel();
+                    if (n != null) {
+                        archivos.moverPapelera(n.getId());
+                        recargar();
+                        aviso = "movida a la papelera — t para abrirla";
+                    }
+                    break;
+                }
                 case 'f': toggleFav(); break;
+                case 'm': if (notaSel() != null) {
+                              promptEd.setTexto(notaSel().getCarpeta());
+                              estado = State.MOVE;
+                          }
+                          break;
+                case 'r':
+                    if (selIdx < carpetas.size() && !carpetas.isEmpty()) {
+                        renombrarCarpeta = carpetas.get(selIdx);
+                        promptEd.setTexto(renombrarCarpeta);
+                        estado = State.RENAME;
+                    } else if (notaSel() != null) {
+                        renombrarCarpeta = null;
+                        promptEd.setTexto(notaSel().getTitulo());
+                        estado = State.RENAME;
+                    }
+                    break;
+                case 't': abrirPapelera(); break;
                 case '/': inputBusqueda = ""; estado = State.SEARCH; break;
+                case '?': helpVolver = State.LIST; estado = State.HELP; break;
             }
-        } else if (key.getKeyType() == KeyType.Enter && !filtradas.isEmpty()) {
-            estado = State.VIEW;
+        } else if (key.getKeyType() == KeyType.Enter) {
+            if (selIdx < carpetas.size() && !carpetas.isEmpty()) {
+                carpetaActual = carpetas.get(selIdx);
+                selIdx = 0;
+                scroll = 0;
+                aplicarFiltro();
+            } else if (notaSel() != null) {
+                viewScroll = 0;
+                estado = State.VIEW;
+            }
         } else if (key.getKeyType() == KeyType.ArrowDown) {
             navAbajo();
         } else if (key.getKeyType() == KeyType.ArrowUp) {
@@ -133,70 +217,235 @@ public class Terminal {
         return true;
     }
 
+    private void salirCarpeta() {
+        if (!carpetaActual.isEmpty()) {
+            String previa = carpetaActual;
+            carpetaActual = "";
+            selIdx = 0;
+            scroll = 0;
+            aplicarFiltro();
+            int i = carpetas.indexOf(previa);
+            if (i >= 0) {
+                selIdx = i;
+                scroll = Math.max(0, selIdx - contentRows() + 1);
+            }
+        }
+    }
+
     private boolean handleView(KeyStroke key) {
         if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
-        if (key.getKeyType() == KeyType.Character) {
+        if (key.getKeyType() == KeyType.ArrowDown || key.getKeyType() == KeyType.ArrowUp) {
+            viewScroll += (key.getKeyType() == KeyType.ArrowDown) ? 1 : -1;
+        } else if (key.getKeyType() == KeyType.PageDown) {
+            viewScroll += viewRows();
+        } else if (key.getKeyType() == KeyType.PageUp) {
+            viewScroll -= viewRows();
+        } else if (key.getKeyType() == KeyType.Character) {
             char c = key.getCharacter();
-            if (c == 'q') { estado = State.LIST; return true; }
-            if (c == 'e' && !filtradas.isEmpty()) {
-                editando = filtradas.get(selIdx);
-                inputTitulo = editando.getTitulo();
-                inputContenido = editando.getContenido();
-                estado = State.EDIT_CONTENT;
+            switch (c) {
+                case 'q': estado = State.LIST; return true;
+                case 'j': viewScroll++; break;
+                case 'k': viewScroll--; break;
+                case 'g': viewScroll = 0; break;
+                case 'G': viewScroll = Integer.MAX_VALUE; break; // se clampa al renderizar
+                case 'y':
+                    if (notaSel() != null) {
+                        Editor.alPortapapeles(notaSel().getContenido());
+                        aviso = "copiado al portapapeles";
+                    }
+                    break;
+                case 'e':
+                    if (notaSel() != null) abrirEditor(notaSel());
+                    break;
+                case '?': helpVolver = State.VIEW; estado = State.HELP; break;
             }
+        }
+        if (viewScroll < 0) viewScroll = 0;
+        return true;
+    }
+
+    private void abrirEditor(Nota n) {
+        editando = n;
+        tituloEd.setTexto(n == null ? "" : n.getTitulo());
+        tagsEd.setTexto(n == null || n.getTags().isEmpty()
+                ? "" : "#" + String.join(" #", n.getTags()));
+        contenidoEd.setTexto(n == null ? "" : n.getContenido());
+        foco = (n == null) ? Foco.TITULO : Foco.CUERPO;
+        estado = State.EDITOR;
+    }
+
+    private boolean handleEditor(KeyStroke key) {
+        if (key.getKeyType() == KeyType.Escape) {
+            estado = (editando != null) ? State.VIEW : State.LIST;
+            return true;
+        }
+        if (isCtrlS(key)) { guardar(); return true; }
+
+        boolean bajar = key.getKeyType() == KeyType.Enter || key.getKeyType() == KeyType.ArrowDown;
+        switch (foco) {
+            case TITULO:
+                if (bajar) foco = Foco.TAGS;
+                else tituloEd.handle(key);
+                break;
+            case TAGS:
+                if (bajar) foco = Foco.CUERPO;
+                else if (!tagsEd.handle(key) && key.getKeyType() == KeyType.ArrowUp) foco = Foco.TITULO;
+                break;
+            case CUERPO:
+                if (!contenidoEd.handle(key) && key.getKeyType() == KeyType.ArrowUp) foco = Foco.TAGS;
+                break;
         }
         return true;
     }
 
-    private boolean handleNewTitle(KeyStroke key) {
-        if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
-        if (key.getKeyType() == KeyType.Enter)  { estado = State.NEW_CONTENT; return true; }
-        inputTitulo = applyEdit(inputTitulo, key);
-        return true;
-    }
-
-    private boolean handleNewContent(KeyStroke key) {
-        if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
-        if (isCtrlS(key)) {
-            if (!inputTitulo.isBlank()) {
-                archivos.save(new Nota(inputTitulo.strip(), inputContenido));
+    private void guardar() {
+        String titulo = tituloEd.getTexto().strip();
+        List<String> tags = parseTags(tagsEd.getTexto());
+        if (editando == null) {
+            if (!titulo.isBlank()) {
+                Nota n = new Nota(titulo, contenidoEd.getTexto());
+                n.setCarpeta(carpetaActual);
+                n.setTags(tags);
+                archivos.save(n);
                 recargar();
             }
             estado = State.LIST;
-            return true;
-        }
-        if (key.getKeyType() == KeyType.Enter) { inputContenido += "\n"; return true; }
-        inputContenido = applyEdit(inputContenido, key);
-        return true;
-    }
-
-    private boolean handleEditContent(KeyStroke key) {
-        if (key.getKeyType() == KeyType.Escape) { estado = State.VIEW; return true; }
-        if (isCtrlS(key)) {
-            editando.setTitulo(inputTitulo.strip());
-            editando.setContenido(inputContenido);
+        } else {
+            if (!titulo.isBlank()) editando.setTitulo(titulo);
+            editando.setContenido(contenidoEd.getTexto());
+            editando.setTags(tags);
             editando.setFechaActualizacion(LocalDate.now());
             archivos.save(editando);
             recargar();
             estado = State.VIEW;
+        }
+    }
+
+    private List<String> parseTags(String texto) {
+        List<String> out = new ArrayList<>();
+        for (String t : texto.strip().split("\\s+")) {
+            if (t.startsWith("#")) t = t.substring(1);
+            if (!t.isEmpty() && !out.contains(t)) out.add(t);
+        }
+        return out;
+    }
+
+    private boolean handleMove(KeyStroke key) {
+        if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
+        if (key.getKeyType() == KeyType.Enter) {
+            Nota n = notaSel();
+            if (n != null) {
+                String destino = promptEd.getTexto().strip();
+                n.setCarpeta(destino);
+                archivos.save(n);
+                recargar();
+                aviso = destino.isEmpty() ? "movida a la raíz" : "movida a " + destino + "/";
+            }
+            estado = State.LIST;
             return true;
         }
-        if (key.getKeyType() == KeyType.Enter) { inputContenido += "\n"; return true; }
-        inputContenido = applyEdit(inputContenido, key);
+        promptEd.handle(key);
         return true;
     }
 
-    private boolean handleConfirmDelete(KeyStroke key) {
+    private boolean handleRename(KeyStroke key) {
+        if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
+        if (key.getKeyType() == KeyType.Enter) {
+            String nuevo = promptEd.getTexto().strip();
+            if (renombrarCarpeta != null) {
+                // renombrar carpeta = re-etiquetar todas sus notas
+                // (nombre vacío las manda a la raíz; uno existente las fusiona)
+                for (Nota n : notas) {
+                    if (n.getCarpeta().equals(renombrarCarpeta)) {
+                        n.setCarpeta(nuevo);
+                        archivos.save(n);
+                    }
+                }
+                recargar();
+                int i = carpetas.indexOf(nuevo);
+                if (i >= 0) { selIdx = i; scroll = Math.min(scroll, selIdx); }
+                aviso = nuevo.isEmpty() ? "carpeta disuelta" : "renombrada a " + nuevo + "/";
+            } else if (notaSel() != null && !nuevo.isBlank()) {
+                Nota n = notaSel();
+                n.setTitulo(nuevo);
+                n.setFechaActualizacion(LocalDate.now());
+                archivos.save(n);
+                recargar();
+                aviso = "renombrada";
+            }
+            estado = State.LIST;
+            return true;
+        }
+        promptEd.handle(key);
+        return true;
+    }
+
+    private void abrirPapelera() {
+        papelera = archivos.loadPapelera();
+        papelera.sort((a, b) -> b.getFechaActualizacion().compareTo(a.getFechaActualizacion()));
+        papelIdx = 0;
+        papelScroll = 0;
+        estado = State.TRASH;
+    }
+
+    private boolean handleTrash(KeyStroke key) {
+        if (key.getKeyType() == KeyType.Escape) { estado = State.LIST; return true; }
+        if (key.getKeyType() == KeyType.ArrowDown) { papelAbajo(); return true; }
+        if (key.getKeyType() == KeyType.ArrowUp)   { papelArriba(); return true; }
+        if (key.getKeyType() == KeyType.Character) {
+            char c = key.getCharacter();
+            switch (c) {
+                case 'q': estado = State.LIST; return true;
+                case 'j': papelAbajo();  break;
+                case 'k': papelArriba(); break;
+                case 'r':
+                    if (!papelera.isEmpty()) {
+                        archivos.restaurar(papelera.get(papelIdx).getId());
+                        recargar();
+                        refrescarPapelera();
+                        aviso = "restaurada";
+                    }
+                    break;
+                case 'd':
+                    if (!papelera.isEmpty()) estado = State.CONFIRM_PURGE;
+                    break;
+            }
+        }
+        return true;
+    }
+
+    private boolean handleConfirmPurge(KeyStroke key) {
         if (key.getKeyType() == KeyType.Character) {
             char c = key.getCharacter();
             if (c == 'y' || c == 's') {
-                archivos.delete(filtradas.get(selIdx).getId());
-                recargar();
-                selIdx = Math.min(selIdx, Math.max(0, filtradas.size() - 1));
+                archivos.eliminarDefinitivo(papelera.get(papelIdx).getId());
+                refrescarPapelera();
             }
         }
-        estado = State.LIST;
+        estado = State.TRASH;
         return true;
+    }
+
+    private void refrescarPapelera() {
+        papelera = archivos.loadPapelera();
+        papelera.sort((a, b) -> b.getFechaActualizacion().compareTo(a.getFechaActualizacion()));
+        if (papelIdx >= papelera.size()) papelIdx = Math.max(0, papelera.size() - 1);
+        if (papelScroll > papelIdx) papelScroll = papelIdx;
+    }
+
+    private void papelArriba() {
+        if (papelIdx > 0) {
+            papelIdx--;
+            if (papelIdx < papelScroll) papelScroll = papelIdx;
+        }
+    }
+
+    private void papelAbajo() {
+        if (papelIdx < papelera.size() - 1) {
+            papelIdx++;
+            int h = contentRows();
+            if (papelIdx >= papelScroll + h) papelScroll = papelIdx - h + 1;
+        }
     }
 
     private boolean handleSearch(KeyStroke key) {
@@ -216,14 +465,6 @@ public class Terminal {
         return true;
     }
 
-    private String applyEdit(String text, KeyStroke key) {
-        if (key.getKeyType() == KeyType.Backspace && !text.isEmpty())
-            return text.substring(0, text.length() - 1);
-        if (key.getKeyType() == KeyType.Character && !key.isCtrlDown())
-            return text + key.getCharacter();
-        return text;
-    }
-
     private boolean isCtrlS(KeyStroke key) {
         return key.getKeyType() == KeyType.Character && key.isCtrlDown() && key.getCharacter() == 's';
     }
@@ -236,7 +477,7 @@ public class Terminal {
     }
 
     private void navAbajo() {
-        if (selIdx < filtradas.size() - 1) {
+        if (selIdx < totalEntradas() - 1) {
             selIdx++;
             int h = contentRows();
             if (selIdx >= scroll + h) scroll = selIdx - h + 1;
@@ -244,8 +485,8 @@ public class Terminal {
     }
 
     private void toggleFav() {
-        if (filtradas.isEmpty()) return;
-        Nota n = filtradas.get(selIdx);
+        Nota n = notaSel();
+        if (n == null) return;
         n.setFavorito(!n.isFavorito());
         archivos.save(n);
         recargar();
@@ -253,6 +494,10 @@ public class Terminal {
 
     private int contentRows() {
         return screen.getTerminalSize().getRows() - 4;
+    }
+
+    private int viewRows() {
+        return contentRows() - 3;
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
@@ -264,6 +509,10 @@ public class Terminal {
     //   row rows-2     │ keybindings                                 │
     //   row rows-1     └─────────────────────────────────────────────┘
 
+    private boolean enPapelera() {
+        return estado == State.TRASH || estado == State.CONFIRM_PURGE;
+    }
+
     private void render() throws Exception {
         screen.clear();
         int cols = screen.getTerminalSize().getColumns();
@@ -272,12 +521,10 @@ public class Terminal {
         g.setForegroundColor(FG);
         g.setBackgroundColor(BG);
 
-        boolean inEditor = estado == State.NEW_TITLE
-                || estado == State.NEW_CONTENT
-                || estado == State.EDIT_CONTENT;
-
-        if (inEditor) {
+        if (estado == State.EDITOR) {
             renderEditor(g, cols, rows);
+        } else if (estado == State.HELP) {
+            renderHelp(g, cols, rows);
         } else {
             int listW = 30;
             renderFrame(g, cols, rows, listW);
@@ -296,7 +543,11 @@ public class Terminal {
         g.setCharacter(0, 0, Symbols.SINGLE_LINE_TOP_LEFT_CORNER);
         g.setCharacter(cols - 1, 0, Symbols.SINGLE_LINE_TOP_RIGHT_CORNER);
         hline(g, 1, cols - 2, 0);
-        g.putString(4, 0, " notas ");
+        String titulo = enPapelera() ? " papelera "
+                : carpetaActual.isEmpty() ? " notas "
+                : " notas/" + carpetaActual + " ";
+        if (titulo.length() > listW - 4) titulo = titulo.substring(0, listW - 5) + "… ";
+        g.putString(4, 0, titulo);
         g.setCharacter(listW + 1, 0, Symbols.SINGLE_LINE_T_DOWN);
 
         // Side borders
@@ -319,6 +570,10 @@ public class Terminal {
     }
 
     private void renderList(TextGraphics g, int cols, int rows, int listW) {
+        List<Nota> fuente = enPapelera() ? papelera : filtradas;
+        int nCarpetas = enPapelera() ? 0 : carpetas.size();
+        int sel = enPapelera() ? papelIdx : selIdx;
+        int scr = enPapelera() ? papelScroll : scroll;
         int height = contentRows();
 
         if (estado == State.SEARCH) {
@@ -331,55 +586,84 @@ public class Terminal {
 
         int startRow = (estado == State.SEARCH) ? 2 : 1;
         int visible  = (estado == State.SEARCH) ? height - 1 : height;
+        int titleMax = listW - 9; // 3 prefix + 1 space + 5 date
 
         for (int i = 0; i < visible; i++) {
-            int idx = scroll + i;
-            if (idx >= filtradas.size()) break;
+            int idx = scr + i;
+            if (idx >= nCarpetas + fuente.size()) break;
             int row = startRow + i;
-            Nota n = filtradas.get(idx);
-            boolean sel = (idx == selIdx);
+            boolean esSel = (idx == sel);
 
-            String fav  = n.isFavorito() ? "★" : " ";
-            String date = n.getFechaActualizacion().format(DATE_FMT);
-            int titleMax = listW - 9; // 3 prefix + 1 space + 5 date
-            String title = n.getTitulo();
-            if (title.length() > titleMax) title = title.substring(0, titleMax - 1) + "…";
-            String line = String.format(" %s %-" + titleMax + "s %s", fav, title, date);
+            String line;
+            TextColor color = FG;
+            if (idx < nCarpetas) {
+                String nombre = carpetas.get(idx) + "/";
+                long cuenta = cuentaNotas(carpetas.get(idx));
+                if (nombre.length() > titleMax) nombre = nombre.substring(0, titleMax - 1) + "…";
+                line = String.format("   %-" + titleMax + "s %4d", nombre, cuenta);
+                color = FG_DIM;
+            } else {
+                Nota n = fuente.get(idx - nCarpetas);
+                String fav  = n.isFavorito() ? "★" : " ";
+                String date = n.getFechaActualizacion().format(DATE_FMT);
+                String title = n.getTitulo();
+                if (title.length() > titleMax) title = title.substring(0, titleMax - 1) + "…";
+                line = String.format(" %s %-" + titleMax + "s %s", fav, title, date);
+                if (n.isFavorito()) color = FG_FAV;
+            }
             if (line.length() > listW) line = line.substring(0, listW);
 
-            if (sel) {
+            if (esSel) {
                 g.setForegroundColor(SEL_FG);
                 g.setBackgroundColor(SEL_BG);
-            } else if (n.isFavorito()) {
-                g.setForegroundColor(FG_FAV);
+            } else {
+                g.setForegroundColor(color);
             }
             g.putString(1, row, line);
             g.setForegroundColor(FG);
             g.setBackgroundColor(BG);
         }
 
-        if (!filtradas.isEmpty()) {
+        int total = nCarpetas + fuente.size();
+        if (total > 0) {
             g.setForegroundColor(FG_DIM);
-            g.putString(1, rows - 4, " " + (selIdx + 1) + "/" + filtradas.size());
+            g.putString(1, rows - 4, " " + (sel + 1) + "/" + total);
             g.setForegroundColor(FG);
         }
+    }
+
+    private long cuentaNotas(String carpeta) {
+        return notas.stream().filter(n -> n.getCarpeta().equals(carpeta)).count();
     }
 
     private void renderNote(TextGraphics g, int cols, int rows, int listW) {
         int startCol = listW + 2;
         int contentW = cols - startCol - 1;
-        int maxLines = contentRows() - 3;
+        int maxLines = viewRows();
 
-        if (filtradas.isEmpty()) {
+        Nota n;
+        if (enPapelera()) {
+            n = papelera.isEmpty() ? null : papelera.get(papelIdx);
+        } else if (selIdx < carpetas.size() && !carpetas.isEmpty()) {
+            // cursor sobre una carpeta: resumen
             g.setForegroundColor(FG_DIM);
-            String msg = "sin notas  —  n para crear";
+            String msg = carpetas.get(selIdx) + "/  —  " + cuentaNotas(carpetas.get(selIdx)) + " notas";
+            int mx = startCol + (contentW - msg.length()) / 2;
+            g.putString(Math.max(startCol, mx), rows / 2, msg);
+            g.setForegroundColor(FG);
+            return;
+        } else {
+            n = notaSel();
+        }
+
+        if (n == null) {
+            g.setForegroundColor(FG_DIM);
+            String msg = enPapelera() ? "papelera vacía" : "sin notas  —  n para crear";
             int mx = startCol + (contentW - msg.length()) / 2;
             g.putString(Math.max(startCol, mx), rows / 2, msg);
             g.setForegroundColor(FG);
             return;
         }
-
-        Nota n = filtradas.get(selIdx);
 
         // Title
         g.setForegroundColor(FG_HI);
@@ -394,32 +678,120 @@ public class Terminal {
         for (int i = 0; i < sepLen; i++) sep.append(Symbols.SINGLE_LINE_HORIZONTAL);
         g.putString(startCol, 2, sep.toString());
 
-        // Content
-        g.setForegroundColor(FG);
-        String[] lines = n.getContenido().split("\n", -1);
-        for (int i = 0; i < Math.min(lines.length, maxLines); i++) {
-            String line = lines[i];
-            if (line.length() > contentW) line = line.substring(0, contentW - 1) + "…";
-            g.putString(startCol, 3 + i, line);
+        // Content: markdown ligero + word-wrap + scroll
+        List<Linea> cuerpo = markdown(n.getContenido(), contentW);
+        int maxScroll = Math.max(0, cuerpo.size() - maxLines);
+        int vs = 0;
+        if (estado == State.VIEW) {
+            if (viewScroll > maxScroll) viewScroll = maxScroll;
+            vs = viewScroll;
         }
+        for (int i = 0; i < maxLines && vs + i < cuerpo.size(); i++) {
+            Linea l = cuerpo.get(vs + i);
+            g.setForegroundColor(l.color);
+            g.putString(startCol, 3 + i, l.texto);
+        }
+        g.setForegroundColor(FG);
 
         // Meta
         g.setForegroundColor(FG_DIM);
         String meta = n.getFechaCreacion().toString();
-        if (!n.getTags().isEmpty()) meta += "  " + String.join(" #", n.getTags());
+        if (!n.getTags().isEmpty()) meta += "  #" + String.join("  #", n.getTags());
+        if (maxScroll > 0) {
+            int pct = (int) Math.round(100.0 * (vs + maxLines) / cuerpo.size());
+            meta += "  " + Math.min(100, pct) + "%";
+        }
         if (meta.length() > contentW) meta = meta.substring(0, contentW - 1);
         g.putString(startCol, rows - 4, meta);
         g.setForegroundColor(FG);
     }
 
+    // ── Markdown ligero ───────────────────────────────────────────────────────
+    //
+    //   # titulo        → blanco
+    //   - item          → • item
+    //   - [ ] / - [x]   → casilla (hecha en tenue)
+    //   > cita          → │ cita, tenue
+    //   ```             → bloque de código en blanco
+
+    private static class Linea {
+        final String texto;
+        final TextColor color;
+        Linea(String texto, TextColor color) { this.texto = texto; this.color = color; }
+    }
+
+    private List<Linea> markdown(String contenido, int ancho) {
+        List<Linea> out = new ArrayList<>();
+        boolean codigo = false;
+        for (String cruda : contenido.split("\n", -1)) {
+            String s = cruda.stripLeading();
+            String indent = cruda.substring(0, cruda.length() - s.length());
+
+            if (s.startsWith("```")) {
+                codigo = !codigo;
+                envolver(out, cruda, ancho, FG_DIM);
+                continue;
+            }
+            if (codigo) {
+                envolver(out, cruda, ancho, FG_HI);
+                continue;
+            }
+
+            TextColor color = FG;
+            String texto = cruda;
+            if (s.startsWith("# "))        { texto = s.substring(2); color = FG_HI; }
+            else if (s.startsWith("## "))  { texto = s.substring(3); color = FG_HI; }
+            else if (s.startsWith("### ")) { texto = s.substring(4); color = FG_HI; }
+            else if (s.startsWith("- [x] ") || s.startsWith("- [X] "))
+                                           { texto = indent + "[x] " + s.substring(6); color = FG_DIM; }
+            else if (s.startsWith("- [ ] "))
+                                           { texto = indent + "[ ] " + s.substring(6); }
+            else if (s.startsWith("- ") || s.startsWith("* "))
+                                           { texto = indent + "• " + s.substring(2); }
+            else if (s.startsWith("> "))   { texto = indent + "│ " + s.substring(2); color = FG_DIM; }
+            envolver(out, texto, ancho, color);
+        }
+        return out;
+    }
+
+    private void envolver(List<Linea> out, String linea, int ancho, TextColor color) {
+        if (linea.isEmpty()) { out.add(new Linea("", color)); return; }
+        while (linea.length() > ancho) {
+            int corte = linea.lastIndexOf(' ', ancho);
+            if (corte <= 0) corte = ancho; // palabra más larga que el ancho: cortar
+            out.add(new Linea(linea.substring(0, corte), color));
+            linea = linea.substring(corte).stripLeading();
+        }
+        out.add(new Linea(linea, color));
+    }
+
     private void renderStatus(TextGraphics g, int cols, int rows) {
         g.setForegroundColor(FG_DIM);
+
+        if (estado == State.MOVE || estado == State.RENAME) {
+            String prompt = (estado == State.MOVE) ? "  carpeta: " : "  nombre: ";
+            g.setForegroundColor(FG_FAV);
+            g.putString(1, rows - 2, prompt);
+            promptEd.render(g, 1 + prompt.length(), rows - 2, cols - 3 - prompt.length(), 1, true);
+            g.setForegroundColor(FG);
+            return;
+        }
+
         String s;
-        switch (estado) {
-            case VIEW:           s = "  esc/q volver  e editar"; break;
-            case CONFIRM_DELETE: s = "  borrar?  s/y confirmar  cualquier otra tecla cancela"; break;
-            case SEARCH:         s = "  esc cancelar  enter confirmar"; break;
-            default:             s = "  j/k nav  enter ver  n nueva  d borrar  f fav  / buscar  q salir"; break;
+        if (aviso != null) {
+            s = "  " + aviso;
+        } else {
+            switch (estado) {
+                case VIEW:          s = "  e editar  y copiar  ? ayuda  esc volver"; break;
+                case CONFIRM_PURGE: s = "  eliminar definitivamente?  s/y confirmar  otra tecla cancela"; break;
+                case SEARCH:        s = "  esc cancelar  enter confirmar"; break;
+                case TRASH:         s = "  r restaurar  d eliminar  esc volver"; break;
+                default:
+                    s = carpetaActual.isEmpty()
+                        ? "  enter abrir  n nueva  / buscar  ? ayuda  q salir"
+                        : "  h volver  enter abrir  n nueva  ? ayuda  q salir";
+                    break;
+            }
         }
         if (s.length() > cols - 2) s = s.substring(0, cols - 2);
         g.putString(1, rows - 2, s);
@@ -427,14 +799,13 @@ public class Terminal {
     }
 
     private void renderEditor(TextGraphics g, int cols, int rows) {
-        boolean isEdit = (estado == State.EDIT_CONTENT);
         g.setForegroundColor(FG);
 
         // Frame
         g.setCharacter(0, 0, Symbols.SINGLE_LINE_TOP_LEFT_CORNER);
         g.setCharacter(cols - 1, 0, Symbols.SINGLE_LINE_TOP_RIGHT_CORNER);
         hline(g, 1, cols - 2, 0);
-        g.putString(4, 0, isEdit ? " editar nota " : " nueva nota ");
+        g.putString(4, 0, editando != null ? " editar nota " : " nueva nota ");
         vline(g, 0, 1, rows - 2);
         vline(g, cols - 1, 1, rows - 2);
         g.setCharacter(0, rows - 3, Symbols.SINGLE_LINE_T_RIGHT);
@@ -447,45 +818,113 @@ public class Terminal {
         // Title field
         g.setForegroundColor(FG_DIM);
         g.putString(2, 1, "titulo:");
-        boolean editingTitle = (estado == State.NEW_TITLE);
-        g.setForegroundColor(editingTitle ? FG_HI : FG);
-        String tDisp = inputTitulo + (editingTitle ? "█" : "");
-        if (tDisp.length() > cols - 12) tDisp = tDisp.substring(0, cols - 12);
-        g.putString(10, 1, tDisp);
+        g.setForegroundColor(foco == Foco.TITULO ? FG_HI : FG);
+        tituloEd.render(g, 10, 1, cols - 12, 1, foco == Foco.TITULO);
 
-        // Divider below title
+        // Tags field
+        g.setForegroundColor(FG_DIM);
+        g.putString(2, 2, "tags:");
+        g.setForegroundColor(foco == Foco.TAGS ? FG_HI : FG_DIM);
+        tagsEd.render(g, 10, 2, cols - 12, 1, foco == Foco.TAGS);
+
+        // Divider
         g.setForegroundColor(FG);
-        hline(g, 2, cols - 3, 2);
+        hline(g, 2, cols - 3, 3);
 
         // Content
-        boolean editingContent = (estado == State.NEW_CONTENT || estado == State.EDIT_CONTENT);
-        String[] lines = inputContenido.split("\n", -1);
-        int maxLines = rows - 7;
-
-        if (editingContent && inputContenido.isEmpty()) {
-            g.setForegroundColor(FG_HI);
-            g.putString(2, 3, "█");
-            g.setForegroundColor(FG);
-        }
-
-        for (int i = 0; i < Math.min(lines.length, maxLines); i++) {
-            String line = lines[i];
-            boolean isLast = (i == lines.length - 1);
-            if (isLast && editingContent) {
-                g.setForegroundColor(FG_HI);
-                line = line + "█";
-            }
-            if (line.length() > cols - 4) line = line.substring(0, cols - 5) + "…";
-            g.putString(2, 3 + i, line);
-            g.setForegroundColor(FG);
-        }
+        contenidoEd.render(g, 2, 4, cols - 4, rows - 8, foco == Foco.CUERPO);
 
         // Status
         g.setForegroundColor(FG_DIM);
-        String hint = editingTitle
-                ? "  enter continuar  esc cancelar"
-                : "  ctrl+s guardar  esc cancelar";
+        String hint;
+        switch (foco) {
+            case TITULO: hint = "  enter/↓ a tags  ctrl+s guardar  esc cancelar"; break;
+            case TAGS:   hint = "  #tags con espacios  enter/↓ al contenido"; break;
+            default:     hint = "  ctrl+s guardar  ctrl+z deshacer  esc cancelar"; break;
+        }
         g.putString(1, rows - 2, hint);
+        if (foco == Foco.CUERPO) {
+            String pos = (contenidoEd.getFila() + 1) + ":" + (contenidoEd.getCol() + 1) + " ";
+            g.putString(cols - 1 - pos.length(), rows - 2, pos);
+        }
+        g.setForegroundColor(FG);
+    }
+
+    private static final String[] AYUDA_IZQ = {
+            "lista",
+            "  j/k ↑/↓     navegar",
+            "  g/G         inicio / final",
+            "  enter       abrir nota o carpeta",
+            "  h, esc      salir de la carpeta",
+            "  n           nueva nota",
+            "  d           borrar (a la papelera)",
+            "  f           favorito",
+            "  m           mover a carpeta",
+            "  r           renombrar nota o carpeta",
+            "  t           papelera",
+            "  /           buscar (global, #tag tambien)",
+            "  q           salir",
+            "",
+            "papelera",
+            "  r           restaurar",
+            "  d           eliminar definitivo",
+            "  esc, q      volver",
+    };
+
+    private static final String[] AYUDA_DER = {
+            "vista",
+            "  j/k ↑/↓     scroll",
+            "  g/G         inicio / final",
+            "  e           editar",
+            "  y           copiar al portapapeles",
+            "  esc, q      volver",
+            "",
+            "editor",
+            "  enter/↓, ↑  moverse entre campos",
+            "  ctrl+s      guardar",
+            "  ctrl+z      deshacer",
+            "  ctrl+v      pegar",
+            "  ctrl+k      cortar linea",
+            "  ctrl+←/→    saltar palabra",
+            "  tab         4 espacios",
+            "  esc         cancelar",
+            "",
+            "markdown:  # titulo   - lista   - [ ] tarea   > cita   ```codigo```",
+    };
+
+    private void renderHelp(TextGraphics g, int cols, int rows) {
+        g.setForegroundColor(FG);
+
+        // Frame
+        g.setCharacter(0, 0, Symbols.SINGLE_LINE_TOP_LEFT_CORNER);
+        g.setCharacter(cols - 1, 0, Symbols.SINGLE_LINE_TOP_RIGHT_CORNER);
+        hline(g, 1, cols - 2, 0);
+        g.putString(4, 0, " ayuda ");
+        vline(g, 0, 1, rows - 2);
+        vline(g, cols - 1, 1, rows - 2);
+        g.setCharacter(0, rows - 1, Symbols.SINGLE_LINE_BOTTOM_LEFT_CORNER);
+        g.setCharacter(cols - 1, rows - 1, Symbols.SINGLE_LINE_BOTTOM_RIGHT_CORNER);
+        hline(g, 1, cols - 2, rows - 1);
+
+        int colIzq = 3;
+        int colDer = Math.max(cols / 2 + 1, 40);
+        pintarAyuda(g, AYUDA_IZQ, colIzq, 2, colDer - colIzq - 2, rows);
+        pintarAyuda(g, AYUDA_DER, colDer, 2, cols - colDer - 2, rows);
+
+        g.setForegroundColor(FG_DIM);
+        g.putString(3, rows - 2, "cualquier tecla para volver");
+        g.setForegroundColor(FG);
+    }
+
+    private void pintarAyuda(TextGraphics g, String[] lineas, int x, int y, int ancho, int rows) {
+        for (int i = 0; i < lineas.length && y + i < rows - 2; i++) {
+            String l = lineas[i];
+            if (l.length() > ancho) l = l.substring(0, ancho);
+            // los encabezados de sección van sin sangría
+            boolean encabezado = !l.isEmpty() && !l.startsWith(" ");
+            g.setForegroundColor(encabezado ? FG_HI : FG);
+            g.putString(x, y + i, l);
+        }
         g.setForegroundColor(FG);
     }
 

@@ -13,6 +13,7 @@ public class Nota {
       private LocalDate fechaCreacion;
       private LocalDate fechaActualizacion;
       private List<String> tags;
+      private String carpeta; // "" o null = raíz
 
       // Constructor completo (para cargar desde fichero)
       public Nota(String id, String titulo, String contenido, boolean favorito,
@@ -35,6 +36,7 @@ public class Nota {
             this.fechaCreacion = LocalDate.now();
             this.fechaActualizacion = LocalDate.now();
             this.tags = new ArrayList<>();
+            this.carpeta = "";
       }
 
       public String getId() { return id; }
@@ -47,5 +49,8 @@ public class Nota {
       public LocalDate getFechaCreacion() { return fechaCreacion; }
       public LocalDate getFechaActualizacion() { return fechaActualizacion; }
       public void setFechaActualizacion(LocalDate fecha) { this.fechaActualizacion = fecha; }
-      public List<String> getTags() { return tags; }
+      public List<String> getTags() { return tags == null ? new ArrayList<>() : tags; }
+      public void setTags(List<String> tags) { this.tags = tags; }
+      public String getCarpeta() { return carpeta == null ? "" : carpeta; }
+      public void setCarpeta(String carpeta) { this.carpeta = carpeta; }
 }
